@@ -134,7 +134,7 @@ wss.on("connection", (ws) => {
 
     // ── join_queue ────────────────────────────────────────────────────────────
     if( msg.type === "join_queue" ){
-      const playerName = msg.name?.trim() || "Invitado";
+      const playerName = msg.name?.trim() || "Guest";
       ws.playerName = playerName;
 
       if( waitingQueue.length > 0 ){
