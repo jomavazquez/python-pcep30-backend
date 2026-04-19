@@ -1,25 +1,30 @@
-const express = require("express");
 const http = require("http");
-const { Server } = require("socket.io");
-const cors = require("cors");
+const WebSocket = require("ws");
 
-const app = express();
-app.use(cors());
+const PORT = process.env.PORT || 3000;
 
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-  },
+// ------------------------------------
+// HTTP SERVER (health = /)
+// ------------------------------------
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ status: "ok", service: "python-pcep-backend" }));
 });
 
-// ─── Estado global ────────────────────────────────────────────────────────────
+// ------------------------------------
+// WEBSOCKET SERVER
+// ------------------------------------
+const wss = new WebSocket.Server({ server });
 
 const waitingQueue = [];
 const rooms = new Map();
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ------------------------------------
+// HELPERS
+// ------------------------------------
+const send = (ws, payload) => {
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+};
 
 function generateRoomId() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -31,15 +36,13 @@ function formatScores(room) {
 
 function createRoom(player1, player2, totalQuestions, availableIds) {
   const roomId = generateRoomId();
-
-  // Mezclar los IDs disponibles y coger los primeros totalQuestions
   const questionIds = shuffle([...availableIds]).slice(0, totalQuestions);
 
   const room = {
     id: roomId,
     players: [
-      { socketId: player1.id, name: player1.name, score: 0 },
-      { socketId: player2.id, name: player2.name, score: 0 },
+      { ws: player1.ws, socketId: player1.id, name: player1.name, score: 0 },
+      { ws: player2.ws, socketId: player2.id, name: player2.name, score: 0 },
     ],
     currentTurn: 0,
     currentQuestion: 0,
@@ -64,145 +67,19 @@ function getPlayerIndex(room, socketId) {
   return room.players.findIndex((p) => p.socketId === socketId);
 }
 
-// ─── Conexión ────────────────────────────────────────────────────────────────
+function sendToRoom(room, payload) {
+  room.players.forEach((p) => send(p.ws, payload));
+}
 
-io.on("connection", (socket) => {
-  console.log(`✅ Conectado: ${socket.id}`);
-
-  // ── join_queue ──────────────────────────────────────────────────────────────
-  socket.on("join_queue", ({ name, totalQuestions, questionIds }) => {
-    const playerName = name?.trim() || "Invitado";
-    socket.playerName = playerName;
-
-    if (waitingQueue.length > 0) {
-      const opponent = waitingQueue.shift();
-
-      const resolvedTotal = opponent.totalQuestions || 10;
-      const resolvedIds = opponent.questionIds || [];
-
-      const room = createRoom(
-        { id: opponent.id, name: opponent.playerName },
-        { id: socket.id, name: playerName },
-        resolvedTotal,
-        resolvedIds
-      );
-
-      opponent.join(room.id);
-      socket.join(room.id);
-      opponent.roomId = room.id;
-      socket.roomId = room.id;
-
-      // Emitir individualmente para incluir mySocketId — cada jugador sabe quién es
-      room.players.forEach((player) => {
-        io.to(player.socketId).emit("game_start", {
-          roomId: room.id,
-          totalQuestions: resolvedTotal,
-          players: room.players.map((p) => ({ name: p.name, score: p.score, socketId: p.socketId })),
-          currentTurn: room.currentTurn,
-          scores: formatScores(room),
-          mySocketId: player.socketId,
-        });
-      });
-
-      sendQuestion(room);
-    } else {
-      socket.totalQuestions = totalQuestions || 10;
-      socket.questionIds = questionIds || [];
-      waitingQueue.push(socket);
-      socket.emit("waiting", {
-        message: "Buscando rival...",
-        scores: [{ name: playerName, score: 0 }],
-      });
-      console.log(`⏳ ${playerName} en cola con ${socket.totalQuestions}/${socket.questionIds.length} preguntas`);
-    }
-  });
-
-  // ── answer ──────────────────────────────────────────────────────────────────
-  socket.on("answer", ({ answerId, isCorrect }) => {
-    const room = rooms.get(socket.roomId);
-    if (!room || room.status !== "playing") return;
-
-    const playerIndex = getPlayerIndex(room, socket.id);
-
-    if (playerIndex !== room.currentTurn) {
-      socket.emit("error", { message: "No es tu turno" });
-      return;
-    }
-
-    const opponentIndex = playerIndex === 0 ? 1 : 0;
-    const currentPlayer = room.players[playerIndex];
-    const opponentPlayer = room.players[opponentIndex];
-
-    if (isCorrect) {
-      currentPlayer.score += 1;
-    } else {
-      opponentPlayer.score += 1;
-    }
-
-    room.currentQuestion += 1;
-
-    if (room.currentQuestion >= room.totalQuestions) {
-      room.status = "finished";
-
-      const [p1, p2] = room.players;
-      const winner =
-        p1.score > p2.score ? p1.name : p2.score > p1.score ? p2.name : "Draw";
-
-      io.to(room.id).emit("game_over", {
-        scores: formatScores(room),
-        winner,
-        lastAnswer: {
-          answeredBy: currentPlayer.name,
-          answeredByIndex: playerIndex,
-          isCorrect,
-          answerId,
-        },
-      });
-
-      console.log(`🏁 Sala ${room.id} terminada. Ganador: ${winner}`);
-      rooms.delete(room.id);
-    } else {
-      room.currentTurn = opponentIndex;
-
-      io.to(room.id).emit("answer_result", {
-        answeredBy: currentPlayer.name,
-        answeredByIndex: playerIndex,
-        isCorrect,
-        answerId,
-        scores: formatScores(room),
-        nextTurn: room.currentTurn,
-        nextTurnName: room.players[room.currentTurn].name,
-      });
-
-      // 2s si acertó (confeti), 800ms si falló (flash rápido)
-      const delay = isCorrect ? 2000 : 800;
-      setTimeout(() => {
-        if (rooms.has(room.id)) {
-          sendQuestion(room);
-        }
-      }, delay);
-    }
-  });
-
-  // ── option_selected: retransmitir la opción marcada al rival ────────────────
-  socket.on("option_selected", ({ option }) => {
-    const room = rooms.get(socket.roomId);
-    if (!room || room.status !== "playing") return;
-    socket.to(room.id).emit("opponent_option_selected", { option });
-  });
-
-  // ── leave / disconnect ──────────────────────────────────────────────────────
-  socket.on("leave", () => handleDisconnect(socket));
-  socket.on("disconnect", () => handleDisconnect(socket));
-});
-
-// ─── sendQuestion ─────────────────────────────────────────────────────────────
-
+// ------------------------------------
+// sendQuestion
+// ------------------------------------
 function sendQuestion(room) {
   const questionId = room.questionIds[room.currentQuestion];
   const currentPlayer = room.players[room.currentTurn];
 
-  io.to(room.id).emit("question", {
+  sendToRoom(room, {
+    type: "question",
     questionIndex: room.currentQuestion,
     totalQuestions: room.totalQuestions,
     questionId,
@@ -210,44 +87,204 @@ function sendQuestion(room) {
     currentTurnName: currentPlayer.name,
     scores: formatScores(room),
   });
-
 }
 
-// ─── handleDisconnect ─────────────────────────────────────────────────────────
+// ------------------------------------
+// handleDisconnect
+// ------------------------------------
+function handleDisconnect(ws) {
+  console.log(`❌ Desconectado: ${ws.socketId} (${ws.playerName || "?"})`);
 
-function handleDisconnect(socket) {
-  console.log(`❌ Desconectado: ${socket.id} (${socket.playerName || "?"})`);
-
-  const queueIndex = waitingQueue.findIndex((s) => s.id === socket.id);
+  const queueIndex = waitingQueue.findIndex((s) => s.socketId === ws.socketId);
   if (queueIndex !== -1) {
     waitingQueue.splice(queueIndex, 1);
-    console.log(`🗑️ ${socket.playerName} eliminado de la cola`);
+    console.log(`🗑️ ${ws.playerName} eliminado de la cola`);
     return;
   }
 
-  if (socket.roomId) {
-    const room = rooms.get(socket.roomId);
+  if (ws.roomId) {
+    const room = rooms.get(ws.roomId);
     if (room && room.status === "playing") {
       room.status = "finished";
-      io.to(socket.roomId).emit("opponent_left", {
-        message: `${socket.playerName || "Guest"}`,
+      sendToRoom(room, {
+        type: "opponent_left",
+        message: `${ws.playerName || "Guest"}`,
         scores: formatScores(room),
       });
-      rooms.delete(socket.roomId);
-      console.log(`🗑️ Sala ${socket.roomId} eliminada`);
+      rooms.delete(ws.roomId);
+      console.log(`🗑️ Sala ${ws.roomId} eliminada`);
     }
   }
 }
 
-// ─── Health check ─────────────────────────────────────────────────────────────
+// ------------------------------------
+// WS CONNECTION
+// ------------------------------------
+wss.on("connection", (ws) => {
+  ws.socketId = Math.random().toString(36).substring(2, 10);
+  console.log(`✅ Conectado: ${ws.socketId}`);
 
-app.get("/health", (req, res) =>
-  res.json({ status: "ok", rooms: rooms.size, queue: waitingQueue.length })
-);
+  ws.on("message", (raw) => {
+    let msg;
+    try{
+      msg = JSON.parse(raw.toString());
+    }catch{
+      return;
+    }
 
-// ─── Arrancar ─────────────────────────────────────────────────────────────────
+    // ── join_queue ────────────────────────────────────────────────────────────
+    if( msg.type === "join_queue" ){
+      const playerName = msg.name?.trim() || "Invitado";
+      ws.playerName = playerName;
 
-const PORT = process.env.PORT || 3001;
+      if( waitingQueue.length > 0 ){
+        const opponent = waitingQueue.shift();
+
+        const resolvedTotal = opponent.totalQuestions || 10;
+        const resolvedIds = opponent.questionIds || [];
+
+        const room = createRoom(
+          { ws: opponent, id: opponent.socketId, name: opponent.playerName },
+          { ws, id: ws.socketId, name: playerName },
+          resolvedTotal,
+          resolvedIds
+        );
+
+        opponent.roomId = room.id;
+        ws.roomId = room.id;
+
+        room.players.forEach((player) => {
+          send(player.ws, {
+            type: "game_start",
+            roomId: room.id,
+            totalQuestions: resolvedTotal,
+            players: room.players.map((p) => ({
+              name: p.name,
+              score: p.score,
+              socketId: p.socketId,
+            })),
+            currentTurn: room.currentTurn,
+            scores: formatScores(room),
+            mySocketId: player.socketId,
+          });
+        });
+
+        sendQuestion(room);
+      }else{
+        ws.totalQuestions = msg.totalQuestions || 10;
+        ws.questionIds = msg.questionIds || [];
+        waitingQueue.push(ws);
+        send(ws, {
+          type: "waiting",
+          message: "Buscando rival...",
+          scores: [{ name: playerName, score: 0 }],
+        });
+        console.log(`⏳ ${playerName} en cola`);
+      }
+      return;
+    }
+
+    // ── answer ────────────────────────────────────────────────────────────────
+    if( msg.type === "answer" ){
+      const { answerId, isCorrect } = msg;
+      const room = rooms.get(ws.roomId);
+      if( !room || room.status !== "playing" ) return;
+
+      const playerIndex = getPlayerIndex(room, ws.socketId);
+      if( playerIndex !== room.currentTurn ){
+        send(ws, { type: "error", message: "No es tu turno" });
+        return;
+      }
+
+      const opponentIndex = playerIndex === 0 ? 1 : 0;
+      const currentPlayer = room.players[playerIndex];
+      const opponentPlayer = room.players[opponentIndex];
+
+      if( isCorrect ){
+        currentPlayer.score += 1;
+      }else{
+        opponentPlayer.score += 1;
+      }
+
+      room.currentQuestion += 1;
+
+      if( room.currentQuestion >= room.totalQuestions ){
+        room.status = "finished";
+
+        const [p1, p2] = room.players;
+        const winner = p1.score > p2.score ? p1.name : p2.score > p1.score ? p2.name : "Draw";
+
+        sendToRoom(room, {
+          type: "game_over",
+          scores: formatScores(room),
+          winner,
+          lastAnswer: {
+            answeredBy: currentPlayer.name,
+            answeredByIndex: playerIndex,
+            isCorrect,
+            answerId,
+          },
+        });
+
+        console.log(`🏁 Sala ${room.id} terminada. Ganador: ${winner}`);
+        rooms.delete(room.id);
+      }else{
+        room.currentTurn = opponentIndex;
+
+        sendToRoom(room, {
+          type: "answer_result",
+          answeredBy: currentPlayer.name,
+          answeredByIndex: playerIndex,
+          isCorrect,
+          answerId,
+          scores: formatScores(room),
+          nextTurn: room.currentTurn,
+          nextTurnName: room.players[room.currentTurn].name,
+        });
+
+        const delay = isCorrect ? 2000 : 800;
+        setTimeout(() => {
+          if (rooms.has(room.id)) sendQuestion(room);
+        }, delay);
+      }
+      return;
+    }
+
+    // ── option_selected ───────────────────────────────────────────────────────
+    if( msg.type === "option_selected" ){
+      const room = rooms.get(ws.roomId);
+      if( !room || room.status !== "playing" ) return;
+
+      const opponentIndex = getPlayerIndex(room, ws.socketId) === 0 ? 1 : 0;
+      send(room.players[opponentIndex].ws, {
+        type: "opponent_option_selected",
+        option: msg.option,
+      });
+      return;
+    }
+
+    // ── leave ─────────────────────────────────────────────────────────────────
+    if( msg.type === "leave" ){
+      handleDisconnect(ws);
+      ws.close();
+    }
+  });
+
+  ws.on("close", () => handleDisconnect(ws));
+});
+
+// ------------------------------------
+// KEEP ALIVE
+// ------------------------------------
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.readyState === WebSocket.OPEN) ws.ping();
+  });
+}, 30000);
+
+// ------------------------------------
+// START
+// ------------------------------------
 server.listen(PORT, () => {
-  console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
+  console.log(`🚀 Servidor corriendo en puerto ${PORT}`);
 });
