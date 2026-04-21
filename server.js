@@ -7,8 +7,20 @@ const PORT = process.env.PORT || 3000;
 // HTTP SERVER (health = /)
 // ------------------------------------
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ status: "ok", service: "python-pcep-backend" }));
+  const uptimeSeconds = Math.floor(process.uptime());
+  const days = Math.floor(uptimeSeconds / 86400);
+  const hours = Math.floor((uptimeSeconds % 86400) / 3600);
+  const minutes = Math.floor((uptimeSeconds % 3600) / 60);
+  const seconds = uptimeSeconds % 60;
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: `${days}d ${hours}h ${minutes}m ${seconds}s`,
+    connections: wss.clients.size,
+    activeMatches: rooms.size,
+  }));
 });
 
 // ------------------------------------
