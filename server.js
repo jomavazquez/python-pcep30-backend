@@ -264,15 +264,15 @@ wss.on("connection", (ws) => {
 
     // ── option_selected ───────────────────────────────────────────────────────
     if( msg.type === "option_selected" ){
-      const room = rooms.get(ws.roomId);
-      if( !room || room.status !== "playing" ) return;
+        const room = rooms.get(ws.roomId);
+        if( !room || room.status !== "playing" ) return;
 
-      const opponentIndex = getPlayerIndex(room, ws.socketId) === 0 ? 1 : 0;
-      send(room.players[opponentIndex].ws, {
-        type: "opponent_option_selected",
-        option: msg.option,
-      });
-      return;
+        const opponentIndex = getPlayerIndex(room, ws.socketId) === 0 ? 1 : 0;
+        send(room.players[opponentIndex].ws, {
+            type: "opponent_option_selected",
+            optionIndex: msg.optionIndex,  // ← cambiar option por optionIndex
+        });
+        return;
     }
 
     // ── leave ─────────────────────────────────────────────────────────────────
